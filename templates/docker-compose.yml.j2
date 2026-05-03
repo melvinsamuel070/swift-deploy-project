@@ -1,0 +1,58 @@
+services:
+  api-service:
+    image: {{ app_image }}
+    # Security: Run as non-root and drop all kernel capabilities
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    environment:
+      - MODE={{ mode }}
+      - APP_VERSION={{ version }}
+      - APP_PORT={{ app_port }}
+    networks:
+      - {{ network_name }}
+    volumes:
+      - app_logs:/home/swiftuser/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+      restart_policy:
+        condition: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:{{ app_port }}/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  nginx:
+    image: {{ nginx_image }}
+    # Security: Run as the default non-root nginx user (UID 101)
+    user: "101:101"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE # Required for binding ports < 1024
+    ports:
+      - "{{ nginx_port }}:{{ nginx_port }}"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_logs:/var/log/nginx
+    # Use tmpfs for volatile paths to ensure non-root write access without host mounts
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    networks:
+      - {{ network_name }}
+    depends_on:
+      api-service:
+        condition: service_healthy
+
+networks:
+  {{ network_name }}:
+    driver: {{ network_driver }}
+
+volumes:
+  app_logs:
+  nginx_logs:

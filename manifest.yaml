@@ -1,0 +1,12 @@
+network:
+  driver_type: bridge
+  name: swiftdeploy-net
+nginx:
+  image: nginx:latest
+  port: 8081
+  proxy_timeout: 60s
+services:
+  image: swift-deploy-1-node:latest
+  mode: canary
+  port: 3000
+  version: 1.0.0
