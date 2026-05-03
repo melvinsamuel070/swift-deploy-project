@@ -1,122 +1,247 @@
-# SwiftDeploy CLI 🚀
+# SwiftDeploy CLI 
 
-**SwiftDeploy** is a lightweight, Python-based DevOps orchestration tool designed to automate the deployment of containerized services with built-in support for **Canary releases**, **Chaos Engineering**, and **Automated Health Monitoring**.
+SwiftDeploy is a declarative DevOps orchestration tool that automates the deployment and lifecycle management of containerized services. It generates infrastructure configurations dynamically from a single source of truth (`manifest.yaml`) and manages deployments using Docker and Nginx.
 
-## 🛠 Features
-*   **Infrastructure as Code (IaC):** Generate Nginx and Docker Compose configurations from a single `manifest.yaml` source of truth.
-*   **Canary Deployment:** Seamlessly toggle between `normal` and `canary` modes using the `promote` command.
-*   **Chaos Engineering:** Built-in API to simulate network latency and service errors for resilience testing.
-*   **Security-First:** Docker images run as a non-privileged `swiftuser` to minimize the attack surface.
-*   **Observability:** Custom Nginx log formatting for structured, pipe-separated monitoring.
+---
+
+##  Architecture Overview
+
+SwiftDeploy follows a **declarative infrastructure model**:
+
+* `manifest.yaml` → defines desired system state
+* `swiftdeploy` CLI → generates configs + controls lifecycle
+* Docker → runs services in isolated containers
+* Nginx → acts as a reverse proxy and entry point
+
+All traffic flows through Nginx → API service (no direct exposure of the service port).
 
 ---
 
 ##  Project Structure
-```text
+
 .
 ├── app/
-│   ├── main.py            # FastAPI/Flask Application with Chaos Logic
-│   └── requirements.txt   # Python Dependencies
+│   ├── main.py
+│   └── requirements.txt
 ├── templates/
 │   ├── docker-compose.yml.j2
-│   └── nginx.conf.j2      # Jinja2 Templates for Orchestration
-├── Dockerfile             # Optimized <300MB non-root image
-├── manifest.yaml          # Service Configuration (Single Source of Truth)
-├── swiftdeploy            # Main CLI Executable
+│   └── nginx.conf.j2
+├── Dockerfile
+├── manifest.yaml
+├── swiftdeploy
 └── README.md
 ```
 
----
 
-##  Getting Started
 
-### 1. Installation
-Ensure you have Python 3.10+ and Docker/Docker Compose installed.
-```bash
-# Clone the repository
-git clone <your-repo-link>
-cd swift-deploy-project
+##  Manifest Configuration (Single Source of Truth)
 
-# Set up virtual environment
-python3 -m venv venv
-source venv/bin/activate
+```yaml
+services:
+  image: swift-deploy-1-node:latest
+  port: 3000
+  mode: stable
+  version: "1.0.0"
 
-# Install dependencies
-pip install PyYAML Jinja2
-chmod +x swiftdeploy
+nginx:
+  image: nginx:latest
+  port: 8081
+  proxy_timeout: 60
+
+network:
+  name: swiftdeploy-net
+  driver_type: bridge
 ```
 
-### 2. Deployment Lifecycle
+---
+
+##  CLI Commands
+
+### 1. Initialize
+
 ```bash
-# Initialize configurations
 ./swiftdeploy init
+```
 
-# Validate manifest integrity
+* Parses `manifest.yaml`
+* Generates `nginx.conf` and `docker-compose.yml`
+
+---
+
+### 2. Validate
+
+```bash
 ./swiftdeploy validate
+```
 
-# Deploy the stack
+Performs pre-flight checks:
+
+* Valid YAML structure
+* Required fields present
+* Docker image exists locally
+* Nginx port availability
+* Valid Nginx configuration
+
+---
+
+### 3. Deploy
+
+```bash
 ./swiftdeploy deploy
+```
 
-# Promote to Canary
+* Runs `init`
+* Starts containers using Docker Compose
+* Waits until `/healthz` confirms service readiness
+
+---
+
+### 4. Promote (Canary / Stable)
+
+```bash
 ./swiftdeploy promote canary
+./swiftdeploy promote stable
 ```
+
+* Updates deployment mode in `manifest.yaml`
+* Regenerates configs
+* Restarts only the API container (rolling update)
+* Verifies mode via `/healthz`
 
 ---
 
-##  Resilience & Chaos Testing
-Once the service is deployed, you can test system resilience using the following endpoints:
+### 5. Teardown
 
-**Simulate Latency (5s delay):**
-```bash
-curl -X POST http://localhost:8081/chaos -H "Content-Type: application/json" -d '{"mode": "slow", "duration": 5}'
-```
-
-**Simulate 50% Error Rate:**
-```bash
-curl -X POST http://localhost:8081/chaos -H "Content-Type: application/json" -d '{"mode": "error", "rate": 0.5}'
-```
-
-**Recover to Normal State:**
-```bash
-curl -X POST http://localhost:8081/chaos -H "Content-Type: application/json" -d '{"mode": "recover"}'
-```
-
----
-
-##  Verification Commands
-
-### Log Inspection
-Check for the custom pipe-separated log format:
-```bash
-docker logs swift-deploy-project-nginx-1 --tail 10
-```
-*Expected Output Format:* `TIMESTAMP | STATUS | TIME | UPSTREAM_ADDR | REQUEST`
-
-### Security Check
-Confirm the service is running as a non-root user:
-```bash
-docker exec swift-deploy-project-api-service-1 whoami
-# Output: swiftuser
-```
-
-### Cleanup
-To remove all generated files and stop containers:
 ```bash
 ./swiftdeploy teardown --clean
 ```
 
+* Stops and removes containers, volumes, and networks
+* Deletes generated configuration files
+
 ---
 
-##  Configuration (manifest.yaml)
-```yaml
-app_name: "api-service"
-version: "1.0.0"
-port: 8081
-image: "swift-deploy-1-node:latest"
-mode: "normal"  # normal or canary
+##  Canary Deployment Strategy
+
+SwiftDeploy supports controlled rollout using **canary deployments**:
+
+* Same container image runs in different modes (`stable` or `canary`)
+* Mode is injected via environment variables
+* Canary mode:
+
+  * Adds `X-Mode: canary` header
+  * Enables `/chaos` endpoint
+* Promotion updates only the service container without downtime
+
+---
+
+##  API Endpoints
+
+| Endpoint   | Description                                         |
+| ---------- | --------------------------------------------------- |
+| `/`        | Returns service metadata (mode, version, timestamp) |
+| `/healthz` | Health check with uptime                            |
+| `/chaos`   | Simulates failures (canary mode only)               |
+
+---
+
+##  Chaos Engineering
+
+Simulate failures:
+
+```bash
+# Slow response
+curl -X POST http://localhost:8081/chaos \
+-H "Content-Type: application/json" \
+-d '{"mode": "slow", "duration": 5}'
+
+# Random errors
+curl -X POST http://localhost:8081/chaos \
+-H "Content-Type: application/json" \
+-d '{"mode": "error", "rate": 0.5}'
+
+# Recover
+curl -X POST http://localhost:8081/chaos \
+-H "Content-Type: application/json" \
+-d '{"mode": "recover"}'
 ```
 
 ---
 
-**Developed by Ugwu Samuel E bube**  
-*HNG14 Stage 4A DevOps Task*
+##  Observability
+
+### Nginx Access Logs Format
+
+```
+$time_iso8601 | $status | ${request_time}s | $upstream_addr | $request
+```
+
+Example:
+
+```
+2026-05-03T21:42:13+00:00 | 200 | 0.005s | 172.21.0.2:3000 | GET / HTTP/1.1
+```
+
+---
+
+##  Security Best Practices
+
+* Containers run as non-root user (`swiftuser`)
+* Linux capabilities dropped
+* Service port is not exposed directly
+* Only Nginx is publicly accessible
+
+---
+
+##  Verification
+
+### Check headers
+
+```bash
+curl -i http://localhost:8081/
+```
+
+Expected:
+
+```
+X-Deployed-By: swiftdeploy
+X-Mode: canary
+```
+
+---
+
+### Check logs
+
+```bash
+docker logs swift-deploy-project-nginx-1
+```
+
+---
+
+### Check container user
+
+```bash
+docker exec swift-deploy-project-api-service-1 whoami
+```
+
+---
+
+##  Setup
+
+```bash
+git clone <your-repo-link>
+cd swift-deploy-project
+
+python3 -m venv venv
+source venv/bin/activate
+
+pip install PyYAML Jinja2
+chmod +x swiftdeploy
+```
+
+---
+
+##  Author
+
+**Ugwu Samuel E Bube**
+HNG14 DevOps Track — Stage 4A
