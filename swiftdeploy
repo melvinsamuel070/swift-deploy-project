@@ -19,10 +19,7 @@ def save_manifest(config):
     with open('manifest.yaml', 'w') as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
-def init():
-    print("🚀 Initializing configurations...")
-    config = load_manifest()
-    
+def render_configs(config, backend_host):
     context = {
         "app_image": config['services']['image'],
         "app_port": config['services']['port'],
@@ -33,21 +30,32 @@ def init():
         "proxy_timeout": str(config['nginx'].get('proxy_timeout', '60')).replace('s', ''),
         "network_name": config['network']['name'],
         "network_driver": config['network']['driver_type'],
-        "app_name": "api-service"
+        "app_name": "api-service",
+        "backend_host": backend_host
     }
 
-    # Render Templates
-    for tmpl_name, out_name in [('nginx.conf.j2', 'nginx.conf'), ('docker-compose.yml.j2', 'docker-compose.yml')]:
+    for tmpl_name, out_name in [
+        ('nginx.conf.j2', 'nginx.conf'),
+        ('docker-compose.yml.j2', 'docker-compose.yml')
+    ]:
         template_path = f'templates/{tmpl_name}'
         if not os.path.exists(template_path):
             print(f"❌ Error: Template {template_path} not found!")
             sys.exit(1)
-            
+
         with open(template_path) as f:
             tmpl = Template(f.read())
+
         with open(out_name, 'w') as f:
             f.write(tmpl.render(context))
-    
+
+def init():
+    print("🚀 Initializing configurations...")
+    config = load_manifest()
+
+    # ALWAYS generate for runtime (docker network)
+    render_configs(config, backend_host="api-service")
+
     print("✅ Generated nginx.conf and docker-compose.yml")
 
 def validate():
@@ -55,124 +63,164 @@ def validate():
     config = load_manifest()
     all_passed = True
 
-    # 1. YAML Validity
+    # 1. YAML validity
     print("✅ manifest.yaml is valid YAML")
 
-    # 2. Required Fields
+    # 2. Required fields
     checks = [
-        ('services', 'image'), ('services', 'port'), 
-        ('nginx', 'port'), ('network', 'name')
+        ('services', 'image'),
+        ('services', 'port'),
+        ('nginx', 'port'),
+        ('network', 'name')
     ]
+
     for sec, key in checks:
         if not config.get(sec, {}).get(key):
-            print(f"❌ Missing: {sec}.{key}"); all_passed = False
-    
-    if all_passed: print("✅ All required fields present")
+            print(f"❌ Missing: {sec}.{key}")
+            all_passed = False
 
-    # 3. Image existence
+    if all_passed:
+        print("✅ All required fields present")
+
+    # 3. Docker image check
     img = config['services']['image']
     if subprocess.run(['docker', 'inspect', img], capture_output=True).returncode != 0:
-        print(f"❌ Image {img} not found locally. Run 'docker build' first."); all_passed = False
+        print(f"❌ Image {img} not found locally.")
+        all_passed = False
     else:
         print(f"✅ Docker image {img} verified")
 
-    # 4. Port availability
+    # 4. Port check
     port = config['nginx']['port']
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(1)
         if s.connect_ex(('127.0.0.1', port)) == 0:
-            print(f"❌ Port {port} is occupied on the host."); all_passed = False
+            print(f"❌ Port {port} is occupied on the host.")
+            all_passed = False
         else:
             print(f"✅ Port {port} is available")
 
-    # 5. Nginx syntax - Force root for test to satisfy PID/temp folder checks
+    # 🔥 FIX: generate VALID nginx config for host validation
+    render_configs(config, backend_host="127.0.0.1")
+
+    # 5. Nginx syntax check (CRITICAL FIX HERE)
     if os.path.exists('nginx.conf'):
         res = subprocess.run([
-            'docker', 'run', '--rm', 
-            '--user', 'root',
+            'docker', 'run', '--rm',
             '-v', f"{os.getcwd()}/nginx.conf:/etc/nginx/nginx.conf:ro",
-            '-v', "/tmp:/tmp",
-            'nginx:latest', 'nginx -t'
-        ], capture_output=True)
+            'nginx:latest',
+            'nginx', '-t'
+        ], capture_output=True, text=True)
+
         if res.returncode != 0:
-            print("❌ nginx.conf syntax error."); all_passed = False
+            print("❌ nginx.conf syntax error.")
+            print(res.stderr.strip())
+            all_passed = False
         else:
             print("✅ nginx.conf syntax is valid")
     else:
-        print("❌ nginx.conf not found. Run 'init' first."); all_passed = False
+        print("❌ nginx.conf not found.")
+        all_passed = False
 
-    if not all_passed: sys.exit(1)
+    if not all_passed:
+        sys.exit(1)
+
     print("\n🚀 All checks passed!")
 
 def deploy():
-    init()
+    config = load_manifest()
+
+    render_configs(config, backend_host="api-service")
+
     print("🏗️ Bringing up stack...")
     subprocess.run(['docker', 'compose', 'up', '-d'])
-    
-    print("⏳ Waiting for health check (max 60s)...")
-    port = load_manifest()['nginx']['port']
-    health_url = f'http://127.0.0.1:{port}/healthz'
-    
-    for i in range(20):
-        try:
-            res = subprocess.run(['curl', '-s', '-o', '/dev/null', '-w', '%{http_code}', health_url], capture_output=True, text=True)
-            if res.stdout.strip() == "200":
-                print("✨ Service is UP and Healthy!"); return
-        except Exception:
-            pass
-        time.sleep(3)
-    
-    print("❌ Deployment timed out. Check 'docker compose logs' for details."); sys.exit(1)
 
-def promote(new_mode):
-    print(f"🔄 Promoting to {new_mode}...")
-    config = load_manifest()
-    config['services']['mode'] = new_mode
-    save_manifest(config)
-    
-    init() 
-    subprocess.run(['docker', 'compose', 'up', '-d', '--no-deps', 'api-service'])
-    
-    print(f"⏳ Verifying {new_mode} mode...")
-    time.sleep(5)
+    print("⏳ Waiting for health check (max 60s)...")
+
     port = config['nginx']['port']
-    res = subprocess.run(['curl', '-s', f'http://127.0.0.1:{port}/healthz'], capture_output=True, text=True)
-    if new_mode in res.stdout.lower():
-        print(f"✅ Confirmed: Mode is now {new_mode}")
+    url = f'http://127.0.0.1:{port}/healthz'
+
+    for _ in range(20):
+        res = subprocess.run(
+            ['curl', '-s', '-o', '/dev/null', '-w', '%{http_code}', url],
+            capture_output=True,
+            text=True
+        )
+
+        if res.stdout.strip() == "200":
+            print("✨ Service is UP and Healthy!")
+            return
+
+        time.sleep(3)
+
+    print("❌ Deployment timed out.")
+    sys.exit(1)
+
+def promote(mode):
+    print(f"🔄 Promoting to {mode}...")
+    config = load_manifest()
+
+    config['services']['mode'] = mode
+    save_manifest(config)
+
+    render_configs(config, backend_host="api-service")
+
+    subprocess.run(['docker', 'compose', 'up', '-d', '--no-deps', 'api-service'])
+
+    time.sleep(5)
+
+    port = config['nginx']['port']
+    res = subprocess.run(
+        ['curl', '-s', f'http://127.0.0.1:{port}/healthz'],
+        capture_output=True,
+        text=True
+    )
+
+    if mode in res.stdout.lower():
+        print(f"✅ Mode confirmed: {mode}")
     else:
-        print(f"⚠️ Mode updated in manifest, but API /healthz did not reflect it yet.")
+        print("⚠️ Mode not reflected yet")
 
 def teardown(clean):
     print("🛑 Tearing down...")
     subprocess.run(['docker', 'compose', 'down', '-v'])
+
     if clean:
         for f in ['nginx.conf', 'docker-compose.yml']:
-            if os.path.exists(f): 
+            if os.path.exists(f):
                 os.remove(f)
                 print(f"🧹 Removed {f}")
-        print("✅ Cleanup complete.")
+
+        print("✅ Cleanup complete")
 
 def main():
-    parser = argparse.ArgumentParser(description="SwiftDeploy CLI")
+    parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command")
-    
-    sub.add_parser('init')
-    sub.add_parser('validate')
-    sub.add_parser('deploy')
-    
-    p = sub.add_parser('promote')
-    p.add_argument('mode', choices=['stable', 'canary'])
-    
-    t = sub.add_parser('teardown')
-    t.add_argument('--clean', action='store_true')
+
+    sub.add_parser("init")
+    sub.add_parser("validate")
+    sub.add_parser("deploy")
+
+    p = sub.add_parser("promote")
+    p.add_argument("mode", choices=["stable", "canary"])
+
+    t = sub.add_parser("teardown")
+    t.add_argument("--clean", action="store_true")
 
     args = parser.parse_args()
-    if args.command == 'init': init()
-    elif args.command == 'validate': validate()
-    elif args.command == 'deploy': deploy()
-    elif args.command == 'promote': promote(args.mode)
-    elif args.command == 'teardown': teardown(args.clean)
-    else: parser.print_help()
+
+    if args.command == "init":
+        init()
+    elif args.command == "validate":
+        validate()
+    elif args.command == "deploy":
+        deploy()
+    elif args.command == "promote":
+        promote(args.mode)
+    elif args.command == "teardown":
+        teardown(args.clean)
+    else:
+        parser.print_help()
 
 if __name__ == "__main__":
     main()
